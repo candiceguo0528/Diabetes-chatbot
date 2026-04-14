@@ -1,0 +1,725 @@
+!pip install pingouin
+pip install tqdm
+import pandas as pd
+import pingouin as pg
+import numpy as np
+import statsmodels.api as sm
+import warnings
+from tqdm import tqdm
+FILE_PATH = r"C:\Users\Zhijun\Desktop\diabetes\data analysis\ratings.xlsx"
+df = pd.read_excel(FILE_PATH)
+
+quality_cols = [
+    "clinical_accuracy",
+    "guideline_adherence",
+    "actionability",
+    "personalization",
+    "clarity",
+    "empathy",
+]
+
+for c in quality_cols:
+    df[c] = pd.to_numeric(df[c], errors="coerce")
+
+df["overall_quality"] = df[quality_cols].mean(axis=1)
+
+# =========================
+# =========================
+df["responder_type"] = pd.Series(pd.NA, index=df.index, dtype="string")
+df.loc[df["responder_type=LLM"] == 1, "responder_type"] = "LLM"
+df.loc[df["responder_type=Clinician"] == 1, "responder_type"] = "Clinician"
+
+# =========================
+
+#Case_id + Question_id + response_id + responder_type 
+# =========================
+df["target_id"] = (
+    df["Case_id"].astype(str).str.strip() + "_" +
+    df["Question_id"].astype(str).str.strip() + "_" +
+    df["response_id"].astype(str).str.strip() + "_" +
+    df["responder_type"].astype(str)
+)
+
+# rater_id 
+df["rater_id"] = df["rater_id"].astype(str).str.strip()
+
+# ICC 
+icc_df = df[["target_id", "rater_id", "overall_quality"]].copy()
+icc_df = icc_df.dropna(subset=["target_id", "rater_id", "overall_quality"])
+# remove target_id NA/nan 
+icc_df = icc_df[~icc_df["target_id"].str.contains(r"\bNA\b|\bnan\b", case=False, na=False)]
+
+# =========================
+# 4) sanity check
+# =========================
+print("=== Sanity check ===")
+print("rows:", len(icc_df))
+print("unique targets:", icc_df["target_id"].nunique())
+print("unique raters:", icc_df["rater_id"].nunique())
+
+counts = icc_df.groupby("target_id")["rater_id"].count()
+print("ratings per target (min/median/max):", int(counts.min()), float(counts.median()), int(counts.max()))
+print("targets with exactly 3 ratings:", int((counts == 3).sum()), " / ", int(len(counts)))
+
+# icc_df = icc_df[icc_df["target_id"].isin(counts[counts == 3].index)].copy()
+# print("After filtering to exactly 3 ratings, rows:", len(icc_df), "targets:", icc_df["target_id"].nunique())
+
+#    y_ij = mu + u_target(i) + v_rater(j) + e_ij
+# =========================
+md = sm.MixedLM.from_formula(
+    "overall_quality ~ 1",
+    groups="target_id",                         # targe
+    vc_formula={"rater": "0 + C(rater_id)"},    # rater
+    re_formula="1",
+    data=icc_df
+)
+
+m = md.fit(reml=True, method="lbfgs")
+print("\nModel converged:", m.converged)
+print(m.summary())
+
+
+var_target = float(m.cov_re.iloc[0, 0])                 # target 
+var_rater  = float(m.vcomp[0]) if len(m.vcomp) else 0.0 # rater 
+var_error  = float(m.scale)                             
+
+icc2_1 = var_target / (var_target + var_rater + var_error)
+
+k = 3
+icc2_3 = var_target / (var_target + var_rater / k + var_error / k)
+
+print("\n=== Variance components ===")
+print(f"Var(target) = {var_target:.6f}")
+print(f"Var(rater)  = {var_rater:.6f}")
+print(f"Var(error)  = {var_error:.6f}")
+
+print("\n=== ICC (two-way random, absolute agreement; crossed/unbalanced via mixed model) ===")
+print(f"ICC(2,1) ≈ {icc2_1:.3f}")
+print(f"ICC(2,3) ≈ {icc2_3:.3f}   (averaging 3 raters)")
+
+# ----------------------------
+# Bootstrap ICC CI (cluster bootstrap on target_id)
+# ----------------------------
+def fit_icc_mixedlm(data: pd.DataFrame, k: int = 3):
+    """Fit MixedLM and return (icc2_1, icc2_k, var_target, var_rater, var_error, converged)."""
+    md = sm.MixedLM.from_formula(
+        "overall_quality ~ 1",
+        groups="target_id",
+        vc_formula={"rater": "0 + C(rater_id)"},
+        re_formula="1",
+        data=data
+    )
+    m = md.fit(reml=True, method="lbfgs", disp=False)
+
+    var_target = float(m.cov_re.iloc[0, 0])
+    var_rater  = float(m.vcomp[0]) if len(m.vcomp) else 0.0
+    var_error  = float(m.scale)
+
+    icc2_1 = var_target / (var_target + var_rater + var_error)
+    icc2_k = var_target / (var_target + var_rater / k + var_error / k)
+
+    return icc2_1, icc2_k, var_target, var_rater, var_error, bool(m.converged)
+
+
+def bootstrap_icc_ci(icc_df: pd.DataFrame, k: int = 3, B: int = 1000, seed: int = 2026):
+    """
+    Cluster bootstrap by target_id to obtain percentile 95% CI for ICC(2,1) and ICC(2,k).
+    Returns dict with point estimates + CI + bootstrap distribution summary.
+    """
+    rng = np.random.default_rng(seed)
+
+    targets = icc_df["target_id"].unique()
+    n_targets = len(targets)
+
+    # Point estimate on full data
+    icc2_1_hat, icc2_k_hat, vt_hat, vr_hat, ve_hat, conv_hat = fit_icc_mixedlm(icc_df, k=k)
+
+    icc2_1_boot = []
+    icc2_k_boot = []
+    n_fail = 0
+
+    # Pre-group rows per target for fast resampling
+    grouped = {tid: g for tid, g in icc_df.groupby("target_id", sort=False)}
+
+    warnings.filterwarnings("ignore")  # MixedLM often throws convergence warnings in bootstrap
+
+    for _ in tqdm(range(B), desc=f"Bootstrapping ICC (B={B})"):
+        sampled_targets = rng.choice(targets, size=n_targets, replace=True)
+
+        # Concatenate sampled clusters; re-label target_id to keep duplicates independent
+        # (important: if a target is sampled twice, they must be treated as two clusters)
+        boot_parts = []
+        for j, tid in enumerate(sampled_targets):
+            g = grouped[tid].copy()
+            g["target_id"] = g["target_id"].astype(str) + f"__boot{j}"
+            boot_parts.append(g)
+
+        boot_df = pd.concat(boot_parts, axis=0, ignore_index=True)
+
+        try:
+            icc2_1_b, icc2_k_b, *_ = fit_icc_mixedlm(boot_df, k=k)
+            if np.isfinite(icc2_1_b) and np.isfinite(icc2_k_b):
+                icc2_1_boot.append(icc2_1_b)
+                icc2_k_boot.append(icc2_k_b)
+            else:
+                n_fail += 1
+        except Exception:
+            n_fail += 1
+            continue
+
+    icc2_1_boot = np.array(icc2_1_boot, dtype=float)
+    icc2_k_boot = np.array(icc2_k_boot, dtype=float)
+
+    # Percentile CI
+    ci_1 = np.quantile(icc2_1_boot, [0.025, 0.975]) if len(icc2_1_boot) else (np.nan, np.nan)
+    ci_k = np.quantile(icc2_k_boot, [0.025, 0.975]) if len(icc2_k_boot) else (np.nan, np.nan)
+
+    return {
+        "point": {
+            "ICC(2,1)": icc2_1_hat,
+            f"ICC(2,{k})": icc2_k_hat,
+            "Var_target": vt_hat,
+            "Var_rater": vr_hat,
+            "Var_error": ve_hat,
+            "Converged": conv_hat,
+        },
+        "bootstrap": {
+            "B_requested": B,
+            "B_success": int(len(icc2_1_boot)),
+            "B_failed": int(n_fail),
+            "ICC(2,1)_CI95": tuple(ci_1),
+            f"ICC(2,{k})_CI95": tuple(ci_k),
+        }
+    }
+
+
+# ---- run it ----
+res = bootstrap_icc_ci(icc_df, k=3, B=1000, seed=2026)
+
+print("\n=== ICC point estimates ===")
+for k_, v_ in res["point"].items():
+    print(f"{k_}: {v_}")
+
+print("\n=== ICC bootstrap 95% CI (percentile) ===")
+print(f"ICC(2,1) 95% CI: {res['bootstrap']['ICC(2,1)_CI95'][0]:.3f} to {res['bootstrap']['ICC(2,1)_CI95'][1]:.3f}")
+print(f"ICC(2,3) 95% CI: {res['bootstrap']['ICC(2,3)_CI95'][0]:.3f} to {res['bootstrap']['ICC(2,3)_CI95'][1]:.3f}")
+print(f"Bootstrap success: {res['bootstrap']['B_success']}/{res['bootstrap']['B_requested']} (failed={res['bootstrap']['B_failed']})")
+for c in quality_cols:
+    df[c] = pd.to_numeric(df[c], errors="coerce")
+
+# overall quality
+df["overall_quality"] = df[quality_cols].mean(axis=1)
+
+# responder_type
+df["responder_type"] = pd.Series(pd.NA, index=df.index, dtype="string")
+df.loc[df["responder_type=LLM"] == 1, "responder_type"] = "Chatbot"
+df.loc[df["responder_type=Clinician"] == 1, "responder_type"] = "Clinician"
+
+overall_means = (
+    df
+    .groupby("responder_type")[quality_cols + ["overall_quality"]]
+    .mean()
+    .round(3)
+)
+
+print("=== Overall mean scores ===")
+print(overall_means)
+overall_summary = (
+    df
+    .groupby("responder_type")[quality_cols + ["overall_quality"]]
+    .agg(["mean", "std"])
+    .round(3)
+)
+
+print("=== Overall mean ± SD ===")
+overall_summary
+domain_means = (
+    df
+    .groupby(["responder_type", "domain"])[quality_cols + ["overall_quality"]]
+    .mean()
+    .round(3)
+)
+
+print("=== Domain-specific mean scores ===")
+domain_means
+
+
+cols_to_summarise = quality_cols + ["overall_quality"]# 计算 mean, sd, n
+summary = (
+    df
+    .groupby("responder_type")["overall_quality"]
+    .agg(["mean", "std", "count"])
+)
+
+# 95% CI
+summary["se"] = summary["std"] / np.sqrt(summary["count"])
+summary["ci_low"] = summary["mean"] - 1.96 * summary["se"]
+summary["ci_high"] = summary["mean"] + 1.96 * summary["se"]
+summary = summary.round(3)
+
+print(summary)
+
+cols_to_summarise = quality_cols + ["overall_quality"]
+
+#  mean, sd, n
+domain_summary = (
+    df
+    .groupby(["responder_type", "domain"])[cols_to_summarise]
+    .agg(["mean", "std", "count"])
+
+domain_summary.columns = ["_".join(col) for col in domain_summary.columns]
+
+# 95% CI
+for col in cols_to_summarise:
+    mean_col = f"{col}_mean"
+    sd_col   = f"{col}_std"
+    n_col    = f"{col}_count"
+
+    se = domain_summary[sd_col] / np.sqrt(domain_summary[n_col])
+    domain_summary[f"{col}_ci_low"]  = domain_summary[mean_col] - 1.96 * se
+    domain_summary[f"{col}_ci_high"] = domain_summary[mean_col] + 1.96 * se
+
+domain_summary = domain_summary.round(3)
+
+print("=== Domain-specific mean ± SD + 95% CI ===")
+cols_keep = [
+    "overall_quality_mean",
+    "overall_quality_std",
+    "overall_quality_ci_low",
+    "overall_quality_ci_high"
+]
+
+domain_summary_clean = domain_summary[cols_keep].round(3)
+domain_summary_clean
+
+df["overall_quality"] = df[quality_cols].mean(axis=1)
+cols = quality_cols + ["overall_quality"]
+
+g = df.groupby(["responder_type", "domain"])[cols]
+
+mean_df = g.mean()
+sd_df   = g.std()
+
+# "mean ± sd"
+out = mean_df.round(2).astype(str) + " ± " + sd_df.round(2).astype(str)
+
+print("=== Domain × Dimension: Mean ± SD ===")
+out
+
+import pandas as pd
+from scipy.stats import wilcoxon, shapiro
+
+
+grouped = df.groupby(['Case_id', 'Question_id', 'responder_type=Clinician'])['clinical_accuracy'].mean().unstack()
+grouped.columns = ['Chatbot_Mean', 'Clinician_Mean']
+grouped = grouped.dropna()
+
+
+
+diff = grouped['Chatbot_Mean'] - grouped['Clinician_Mean']
+stat, p_normal = shapiro(diff)
+
+
+if p_normal > 0.05:
+    from scipy.stats import ttest_rel
+    stat, p_val = ttest_rel(grouped['Chatbot_Mean'], grouped['Clinician_Mean'])
+    test_name = "Paired t-test"
+else:
+    stat, p_val = wilcoxon(grouped['Chatbot_Mean'], grouped['Clinician_Mean'])
+    test_name = "Wilcoxon signed-rank test"
+
+print(f"sensitivity ({test_name}):")
+print(f"Chatbot_mean: {grouped['Chatbot_Mean'].mean():.2f}")
+print(f"Clinician_mean: {grouped['Clinician_Mean'].mean():.2f}")
+print(f"P_value: {p_val:.4f}")
+
+cq_mean = (
+    resp.groupby(["Case_id", "Question_id", "responder_type"], as_index=False)
+        .agg(cq_mean=("response_mean", "mean"))
+)
+
+
+wide = cq_mean.pivot_table(
+    index=["Case_id", "Question_id"],
+    columns="responder_type",
+    values="cq_mean",
+    aggfunc="first"
+).reset_index()
+
+paired = wide.dropna(subset=["Chatbot", "Clinician"]).copy()
+paired["diff"] = paired["Chatbot"] - paired["Clinician"]
+
+print(f"Matched pairs (case–question): n = {len(paired)}")
+print(paired[["Case_id","Question_id","Chatbot","Clinician","diff"]].head())
+
+
+diff = paired["diff"].dropna().astype(float)
+
+# Shapiro-Wilk 
+shapiro_p = stats.shapiro(diff.sample(min(len(diff), 5000), random_state=0))[1] 
+alpha = 0.05
+
+if shapiro_p >= alpha:
+    test_name = "Paired t-test"
+    t_res = stats.ttest_rel(paired["Chatbot"], paired["Clinician"], nan_policy="omit")
+    p_value = t_res.pvalue
+    stat = t_res.statistic
+
+    mean_diff = diff.mean()
+    sd_diff = diff.std(ddof=1)
+    cohen_dz = mean_diff / sd_diff if sd_diff > 0 else np.nan
+
+    print("\n=== Test: Paired t-test ===")
+    print(f"Shapiro p (sampled) = {shapiro_p:.4g}  -> treat diffs as ~normal")
+    print(f"t = {stat:.4f}, p = {p_value:.4g}")
+    print(f"Mean diff (Chatbot-Clinician) = {mean_diff:.4f}")
+    print(f"Cohen's dz = {cohen_dz:.4f}")
+
+else:
+    test_name = "Wilcoxon signed-rank"
+    # Wilcoxon 
+    w_res = stats.wilcoxon(diff, zero_method="wilcox", alternative="two-sided")
+    p_value = w_res.pvalue
+    stat = w_res.statistic
+
+    # rank-biserial correlation
+    # rbc = 1 - (2 * W / (n*(n+1)))
+    n_eff = (diff != 0).sum()
+    rbc = np.nan
+    if n_eff > 0:
+        rbc = 1 - (2 * stat) / (n_eff * (n_eff + 1))
+
+    print("\n=== Test: Wilcoxon signed-rank ===")
+    print(f"Shapiro p (sampled) = {shapiro_p:.4g}  -> non-normal diffs")
+    print(f"W = {stat:.4f}, p = {p_value:.4g}")
+    print(f"Median diff (Chatbot-Clinician) = {np.median(diff):.4f}")
+    print(f"Rank-biserial corr (approx) = {rbc:.4f}")
+
+print(f"\nSelected test = {test_name}")
+
+df["true_source"] = np.where(
+    df["responder_type=Clinician"] == 1,
+    "Clinician",
+    "LLM"
+)
+
+df["perceived_source_clean"] = df["perceived_source"].astype(str).str.strip()
+
+
+df["correct"] = (
+    (df["perceived_source_clean"] == df["true_source"])
+)
+
+df["not_sure"] = (
+    df["perceived_source_clean"].str.lower() == "not sure"
+)
+
+df["wrong"] = (
+    (~df["correct"]) & (~df["not_sure"])
+)
+
+
+rater_stats = (
+    df.groupby("rater_id")
+      .agg(
+          total=("rater_id", "count"),
+          correct=("correct", "sum"),
+          wrong=("wrong", "sum"),
+          not_sure=("not_sure", "sum")
+      )
+      .reset_index()
+)
+
+rater_stats["correct_%"] = (rater_stats["correct"] / rater_stats["total"] * 100).round(2)
+rater_stats["wrong_%"] = (rater_stats["wrong"] / rater_stats["total"] * 100).round(2)
+rater_stats["not_sure_%"] = (rater_stats["not_sure"] / rater_stats["total"] * 100).round(2)
+
+print("=== rater ===")
+print(rater_stats)
+
+overall = {
+    "total": len(df),
+    "correct": df["correct"].sum(),
+    "wrong": df["wrong"].sum(),
+    "not_sure": df["not_sure"].sum()
+}
+
+overall["correct_%"] = round(overall["correct"] / overall["total"] * 100, 2)
+overall["wrong_%"] = round(overall["wrong"] / overall["total"] * 100, 2)
+overall["not_sure_%"] = round(overall["not_sure"] / overall["total"] * 100, 2)
+
+print("\n=== overall ===")
+print(overall)
+
+domains = df['domain'].dropna().unique()
+domain_results = []
+
+for d in domains:
+    subset = df[df['domain'] == d]
+    
+    try:
+        model_d = smf.mixedlm(
+            "overall_quality ~ C(responder_type, Treatment('Clinician'))", 
+            data=subset, 
+            groups=subset["Case_id"], 
+            vc_formula={"rater_id": "0 + C(rater_id)"}
+        )
+        
+        res_d = model_d.fit()
+        
+
+        param_name = "C(responder_type, Treatment('Clinician'))[T.Chatbot]"
+        
+
+        coef = res_d.fe_params[param_name]
+        p_val = res_d.pvalues[param_name]
+        conf_int = res_d.conf_int().loc[param_name]
+        
+        domain_results.append({
+            'Domain': d,
+            'Mean_Diff': coef,
+            'CI_low': conf_int[0],
+            'CI_high': conf_int[1],
+            'P_value': p_val
+        })
+    except Exception as e:
+  
+        print(f"Domain {d} model failed. Error: {e}")
+
+
+domain_df = pd.DataFrame(domain_results)
+domain_df['P_value'] = domain_df['P_value'].apply(lambda x: '<0.001' if x < 0.001 else f"{x:.4f}")
+
+print("=== Domain-specific LMM Results ===")
+print(domain_df)
+
+try:
+    from scipy.stats import binomtest
+    use_new_binom = True
+except ImportError:
+    from scipy.stats import binom_test
+    use_new_binom = False
+
+
+
+df["true_source"] = np.where(df["responder_type=Clinician"] == 1, "Clinician", "LLM")
+df["perceived_source_clean"] = df["perceived_source"].astype(str).str.strip()
+
+
+unique_raters = sorted(df["rater_id"].dropna().unique())
+rater_map = {rid: f"Clinician {chr(65+i)}" for i, rid in enumerate(unique_raters)}
+
+results = []
+overall_decided = 0
+overall_correct = 0
+
+for rid in unique_raters:
+    rater_label = rater_map[rid]
+    rater_all = df[df["rater_id"] == rid]
+    
+    decided = rater_all[rater_all["perceived_source_clean"].isin(["Clinician", "LLM"])]
+    n_decided = len(decided)
+    
+    n_correct = sum(decided["perceived_source_clean"] == decided["true_source"])
+    
+    overall_decided += n_decided
+    overall_correct += n_correct
+    
+    if n_decided > 0:
+        if use_new_binom:
+            pval = binomtest(k=n_correct, n=n_decided, p=0.5, alternative='greater').pvalue
+        else:
+            pval = binom_test(x=n_correct, n=n_decided, p=0.5, alternative='greater')
+        
+        acc = n_correct / n_decided
+    else:
+        pval, acc = np.nan, np.nan
+        
+    results.append({
+        "Rater": rater_label,
+        "Valid_Guesses (n)": n_decided,
+        "Correct_Guesses": n_correct,
+        "Accuracy": f"{acc*100:.1f}%",
+        "P_value": "<0.001" if pval < 0.001 else f"{pval:.3f}"
+    })
+
+if use_new_binom:
+    overall_pval = binomtest(k=overall_correct, n=overall_decided, p=0.5, alternative='greater').pvalue
+else:
+    overall_pval = binom_test(x=overall_correct, n=overall_decided, p=0.5, alternative='greater')
+
+results.append({
+    "Rater": "OVERALL",
+    "Valid_Guesses (n)": overall_decided,
+    "Correct_Guesses": overall_correct,
+    "Accuracy": f"{(overall_correct/overall_decided)*100:.1f}%",
+    "P_value": "<0.001" if overall_pval < 0.001 else f"{overall_pval:.3f}"
+})
+
+res_df = pd.DataFrame(results)
+print("=== tuning test ===")
+print(res_df.to_string(index=False))
+
+item_results = []
+
+for item in metrics:
+    formula = f"{item} ~ C(responder_type, Treatment('Clinician'))"
+    
+    try:
+        model = smf.mixedlm(
+            formula, 
+            data=df, 
+            groups=df["Case_id"], 
+            vc_formula={"rater_id": "0 + C(rater_id)"}
+        )
+        res = model.fit()
+        
+        param_name = "C(responder_type, Treatment('Clinician'))[T.Chatbot]"
+        coef = res.fe_params[param_name]
+        p_val = res.pvalues[param_name]
+        conf_int = res.conf_int().loc[param_name]
+        
+        item_results.append({
+            'Quality_Dimension': item,
+            'Mean_Diff (Chatbot-Clinician)': coef,
+            '95% CI_low': conf_int[0],
+            '95% CI_high': conf_int[1],
+            'P_value': p_val
+        })
+    except Exception as e:
+        print(f"Failed to fit {item}. Error: {e}")
+
+item_df = pd.DataFrame(item_results)
+item_df['P_value'] = item_df['P_value'].apply(lambda x: '<0.001' if x < 0.001 else f"{x:.4f}")
+
+print("=== 6 domain(Primary Analysis+) ===")
+print(item_df.to_string(index=False))
+
+# Ensure numeric
+for c in quality_cols:
+    df[c] = pd.to_numeric(df[c], errors="coerce")
+
+# overall_quality
+df["overall_quality"] = df[quality_cols].mean(axis=1)
+
+# responder_type: make sure it is exactly two levels for analysis
+# (Use your actual labels here. I assume "Chatbot" and "Clinician".)
+# If yours are "LLM"/"Clinician", change below accordingly.
+df = df[df["responder_type"].isin(["Chatbot", "Clinician"])].copy()
+
+# Clean IDs
+df["Case_id"] = df["Case_id"].astype(str).str.strip()
+df["rater_id"] = df["rater_id"].astype(str).str.strip()
+
+# -----------------------------
+# 1) Helper: fit MixedLM and extract Chatbot - Clinician effect
+# -----------------------------
+def fit_mixedlm_effect(data: pd.DataFrame, outcome: str):
+    """
+    MixedLM: outcome ~ C(responder_type, Treatment('Clinician'))
+    Random intercepts: Case_id (groups) + rater_id (variance component)
+    Returns: beta, ci_low, ci_high, p_value, converged
+    """
+    d = data[["Case_id", "rater_id", "responder_type", outcome]].dropna().copy()
+
+    # If either group missing, return NA
+    if d["responder_type"].nunique() < 2:
+        return np.nan, np.nan, np.nan, np.nan, False
+
+    # statsmodels formula: set Clinician as reference
+    formula = f"{outcome} ~ C(responder_type, Treatment('Clinician'))"
+
+    md = sm.MixedLM.from_formula(
+        formula,
+        groups="Case_id",
+        vc_formula={"rater": "0 + C(rater_id)"},
+        re_formula="1",
+        data=d
+    )
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        m = md.fit(reml=True, method="lbfgs", disp=False, maxiter=500)
+
+    # Parameter name for Chatbot effect:
+    # C(responder_type, Treatment('Clinician'))[T.Chatbot]
+    term = "C(responder_type, Treatment('Clinician'))[T.Chatbot]"
+    if term not in m.params.index:
+        return np.nan, np.nan, np.nan, np.nan, bool(m.converged)
+
+    beta = float(m.params[term])
+    se = float(m.bse[term])
+    ci_low = beta - 1.96 * se
+    ci_high = beta + 1.96 * se
+    p = float(m.pvalues[term])
+
+    return beta, ci_low, ci_high, p, bool(m.converged)
+
+# -----------------------------
+# 2) Build Table: descriptive + mixed model
+# -----------------------------
+outcomes = quality_cols + ["overall_quality"]
+
+rows = []
+for out in outcomes:
+    # Descriptives (Mean, SD)
+    desc = (
+        df.groupby("responder_type")[out]
+          .agg(["mean", "std", "count"])
+          .reindex(["Chatbot", "Clinician"])
+    )
+
+    cb_mean, cb_sd, cb_n = desc.loc["Chatbot", ["mean", "std", "count"]]
+    cl_mean, cl_sd, cl_n = desc.loc["Clinician", ["mean", "std", "count"]]
+
+    # Mixed model effect: Chatbot - Clinician
+    beta, lo, hi, p, conv = fit_mixedlm_effect(df, out)
+
+    rows.append({
+        "Outcome": out,
+        "Chatbot Mean (SD)": f"{cb_mean:.2f} ({cb_sd:.2f})",
+        "Clinician Mean (SD)": f"{cl_mean:.2f} ({cl_sd:.2f})",
+        "Mean diff (Chatbot−Clinician)": f"{beta:.3f}" if np.isfinite(beta) else "NA",
+        "95% CI": f"{lo:.3f} to {hi:.3f}" if np.isfinite(lo) else "NA",
+        "P value": "<0.001" if (np.isfinite(p) and p < 0.001) else (f"{p:.3f}" if np.isfinite(p) else "NA"),
+        "Converged": conv,
+        "n (Chatbot)": int(cb_n),
+        "n (Clinician)": int(cl_n),
+    })
+
+table2 = pd.DataFrame(rows)
+
+# Optional: nicer outcome names for manuscript
+name_map = {
+    "overall_quality": "Overall quality",
+    "clinical_accuracy": "Clinical accuracy",
+    "guideline_adherence": "Guideline adherence",
+    "actionability": "Actionability",
+    "personalization": "Personalization",
+    "clarity": "Clarity",
+    "empathy": "Empathy",
+}
+table2["Outcome"] = table2["Outcome"].map(lambda x: name_map.get(x, x))
+
+# Reorder rows (Overall first)
+order = ["Overall quality", "Clinical accuracy", "Guideline adherence", "Actionability",
+         "Personalization", "Clarity", "Empathy"]
+table2["Outcome"] = pd.Categorical(table2["Outcome"], categories=order, ordered=True)
+table2 = table2.sort_values("Outcome").reset_index(drop=True)
+
+# Show in console
+print("\n=== Table 2 (Descriptive + MixedLM) ===")
+print(table2[["Outcome", "Chatbot Mean (SD)", "Clinician Mean (SD)",
+              "Mean diff (Chatbot−Clinician)", "95% CI", "P value"]].to_string(index=False))
+
+# Save for manuscript
+table2.to_csv("Table2_quality_comparison.csv", index=False)
+
+# Optional: LaTeX export (for Overleaf)
+latex_cols = ["Outcome", "Chatbot Mean (SD)", "Clinician Mean (SD)",
+              "Mean diff (Chatbot−Clinician)", "95% CI", "P value"]
+latex = table2[latex_cols].to_latex(index=False, escape=False)
+with open("Table2_quality_comparison.tex", "w", encoding="utf-8") as f:
+    f.write(latex)
+
+print("\nSaved: Table2_quality_comparison.csv and Table2_quality_comparison.tex")
