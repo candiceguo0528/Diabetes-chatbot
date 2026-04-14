@@ -287,7 +287,7 @@ def get_icc_table(df: pd.DataFrame, k: int = 3, exact_k_only: bool = True) -> pd
 def bootstrap_icc_ci(
     df: pd.DataFrame,
     score_col: str,
-    n_bootstrap: int = 200,
+    n_bootstrap: int = 1000,
     k: int = 3,
     random_state: int = 42,
 ) -> dict:
