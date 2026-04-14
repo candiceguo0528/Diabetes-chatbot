@@ -1,0 +1,401 @@
+import os
+import warnings
+import numpy as np
+import pandas as pd
+import statsmodels.api as sm
+from scipy import stats
+from sklearn.utils import resample
+
+
+# =========================================================
+# Configuration
+# =========================================================
+QUALITY_COLS = [
+    "clinical_accuracy",
+    "guideline_adherence",
+    "actionability",
+    "personalization",
+    "clarity",
+    "empathy",
+]
+
+CHATBOT_LABEL = "Chatbot"
+CLINICIAN_LABEL = "Clinician"
+
+
+# =========================================================
+# Data loading
+# =========================================================
+def smart_load(file_path: str) -> pd.DataFrame:
+    """
+    Load Excel or CSV file with automatic encoding fallback for CSV.
+    """
+    ext = os.path.splitext(file_path)[1].lower()
+
+    if ext == ".xlsx":
+        return pd.read_excel(file_path)
+
+    if ext == ".csv":
+        for enc in ["utf-8-sig", "gbk", "latin1"]:
+            try:
+                return pd.read_csv(file_path, encoding=enc)
+            except UnicodeDecodeError:
+                continue
+
+    raise ValueError("Unsupported file format or failed to read file.")
+
+
+# =========================================================
+# Preprocessing
+# =========================================================
+def prepare_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Standardize score columns, responder labels, and IDs.
+    """
+    df = df.copy()
+
+    for col in QUALITY_COLS:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df["overall_quality"] = df[QUALITY_COLS].mean(axis=1)
+
+    # Standardize responder_type
+    if "responder_type" not in df.columns or df["responder_type"].isna().all():
+        df["responder_type"] = pd.Series(pd.NA, index=df.index, dtype="string")
+
+        if "responder_type=LLM" in df.columns:
+            df.loc[df["responder_type=LLM"] == 1, "responder_type"] = CHATBOT_LABEL
+
+        if "responder_type=Chatbot" in df.columns:
+            df.loc[df["responder_type=Chatbot"] == 1, "responder_type"] = CHATBOT_LABEL
+
+        if "responder_type=Clinician" in df.columns:
+            df.loc[df["responder_type=Clinician"] == 1, "responder_type"] = CLINICIAN_LABEL
+
+    # Fallback responder label
+    if "responder" not in df.columns:
+        df["responder"] = df["responder_type"]
+
+    # Build target_id for rating-level agreement analysis
+    if {"Case_id", "Question_id"}.issubset(df.columns):
+        df["target_id"] = (
+            df["Case_id"].astype(str) + "_" + df["Question_id"].astype(str)
+        )
+
+    # Build response_uid for response-level analyses
+    if {"Case_id", "Question_id", "response_id"}.issubset(df.columns):
+        df["response_uid"] = (
+            df["Case_id"].astype(str)
+            + "_"
+            + df["Question_id"].astype(str)
+            + "_"
+            + df["response_id"].astype(str)
+        )
+
+    return df
+
+
+# =========================================================
+# Summary statistics
+# =========================================================
+def format_mean_sd(series: pd.Series) -> str:
+    return f"{series.mean():.2f} (±{series.std():.2f})"
+
+
+def format_median_iqr(series: pd.Series) -> str:
+    return (
+        f"{series.median():.1f} "
+        f"[{series.quantile(0.25):.1f}-{series.quantile(0.75):.1f}]"
+    )
+
+
+def get_grouped_summary(df: pd.DataFrame, group_keys):
+    """
+    Return mean/SD and median/IQR summary for each quality dimension.
+    """
+    summary = []
+
+    for name, group in df.groupby(group_keys):
+        row = {"group": name}
+
+        for col in QUALITY_COLS:
+            values = group[col].dropna()
+            row[f"{col}_mean_sd"] = format_mean_sd(values)
+            row[f"{col}_median_iqr"] = format_median_iqr(values)
+
+        summary.append(row)
+
+    return pd.DataFrame(summary)
+
+
+def get_domain_means(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Mean scores by domain and responder group.
+    """
+    result = (
+        df.groupby(["domain", "responder"])[QUALITY_COLS]
+        .mean()
+        .reset_index()
+        .round(2)
+    )
+    return result
+
+
+# =========================================================
+# Word count statistics
+# =========================================================
+def compute_descriptive_stats(data: pd.Series) -> pd.Series:
+    """
+    Compute mean, SD, N, and 95% CI.
+    """
+    data = data.dropna()
+    mean = np.mean(data)
+    sd = np.std(data, ddof=1)
+    n = len(data)
+    sem = stats.sem(data)
+
+    if n > 1:
+        ci_low, ci_high = stats.t.interval(0.95, n - 1, loc=mean, scale=sem)
+    else:
+        ci_low, ci_high = np.nan, np.nan
+
+    return pd.Series({
+        "mean": round(mean, 2),
+        "sd": round(sd, 2),
+        "n": n,
+        "ci_95_lower": round(ci_low, 2) if pd.notna(ci_low) else np.nan,
+        "ci_95_upper": round(ci_high, 2) if pd.notna(ci_high) else np.nan,
+    })
+
+
+def get_word_count_summary(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Summarize word counts for chatbot and clinician responses.
+    """
+    required_cols = ["Case_id", "Question_id", "response_id", "word_count", "responder_type"]
+    missing = [c for c in required_cols if c not in df.columns]
+    if missing:
+        raise ValueError(f"Missing required columns: {missing}")
+
+    unique_responses = df.drop_duplicates(
+        subset=["Case_id", "Question_id", "response_id", "responder_type"]
+    )
+
+    chatbot_data = unique_responses.loc[
+        unique_responses["responder_type"] == CHATBOT_LABEL, "word_count"
+    ]
+    clinician_data = unique_responses.loc[
+        unique_responses["responder_type"] == CLINICIAN_LABEL, "word_count"
+    ]
+
+    chatbot_stats = compute_descriptive_stats(chatbot_data)
+    chatbot_stats.name = CHATBOT_LABEL
+
+    clinician_stats = compute_descriptive_stats(clinician_data)
+    clinician_stats.name = "All_Clinicians"
+
+    if "response_id" in unique_responses.columns:
+        per_clinician = (
+            unique_responses[unique_responses["responder_type"] == CLINICIAN_LABEL]
+            .groupby("response_id")["word_count"]
+            .apply(compute_descriptive_stats)
+            .unstack()
+        )
+        result = pd.concat(
+            [pd.DataFrame(chatbot_stats).T, pd.DataFrame(clinician_stats).T, per_clinician]
+        )
+    else:
+        result = pd.concat(
+            [pd.DataFrame(chatbot_stats).T, pd.DataFrame(clinician_stats).T]
+        )
+
+    return result
+
+
+# =========================================================
+# ICC: mixed-effects model
+# =========================================================
+def fit_icc_for_column(data: pd.DataFrame, score_col: str, k: int = 3) -> dict:
+    """
+    Mixed-effects variance components model:
+        y = mu + u_target + v_rater + e
+
+    Returns:
+        ICC(2,1), ICC(2,k), variance components, and counts.
+    """
+    d = data[["target_id", "rater_id", score_col]].dropna().copy()
+    d = d.rename(columns={score_col: "y"})
+
+    md = sm.MixedLM.from_formula(
+        "y ~ 1",
+        groups="target_id",
+        vc_formula={"rater": "0 + C(rater_id)"},
+        re_formula="1",
+        data=d,
+    )
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        model = md.fit(reml=True, method="lbfgs", disp=False)
+
+    var_target = float(model.cov_re.iloc[0, 0])
+    var_rater = float(model.vcomp[0]) if len(model.vcomp) else 0.0
+    var_error = float(model.scale)
+
+    icc_2_1 = var_target / (var_target + var_rater + var_error)
+    icc_2_k = var_target / (var_target + var_rater / k + var_error / k)
+
+    return {
+        "score": score_col,
+        "n_rows": int(d.shape[0]),
+        "n_targets": int(d["target_id"].nunique()),
+        "n_raters": int(d["rater_id"].nunique()),
+        "var_target": var_target,
+        "var_rater": var_rater,
+        "var_error": var_error,
+        "ICC(2,1)": icc_2_1,
+        f"ICC(2,{k})": icc_2_k,
+        "converged": bool(model.converged),
+    }
+
+
+def get_icc_table(df: pd.DataFrame, k: int = 3, exact_k_only: bool = True) -> pd.DataFrame:
+    """
+    Compute ICC table for all quality dimensions plus overall quality.
+    """
+    if "overall_quality" not in df.columns:
+        df["overall_quality"] = df[QUALITY_COLS].mean(axis=1)
+
+    base = df[["target_id", "rater_id"] + QUALITY_COLS + ["overall_quality"]].copy()
+
+    if exact_k_only:
+        counts = base.dropna(subset=["overall_quality"]).groupby("target_id")["rater_id"].count()
+        base = base[base["target_id"].isin(counts[counts == k].index)].copy()
+
+    results = []
+    for col in QUALITY_COLS + ["overall_quality"]:
+        results.append(fit_icc_for_column(base, col, k=k))
+
+    icc_table = pd.DataFrame(results)
+    return icc_table
+
+
+# =========================================================
+# Bootstrap ICC confidence intervals
+# =========================================================
+def bootstrap_icc_ci(
+    df: pd.DataFrame,
+    score_col: str,
+    n_bootstrap: int = 200,
+    k: int = 3,
+    random_state: int = 42,
+) -> dict:
+    """
+    Bootstrap CI for ICC(2,1) and ICC(2,k) by resampling targets.
+    """
+    rng = np.random.default_rng(random_state)
+
+    base = df[["target_id", "rater_id", score_col]].dropna().copy()
+    unique_targets = base["target_id"].unique()
+
+    icc21_vals = []
+    icc2k_vals = []
+
+    for _ in range(n_bootstrap):
+        sampled_targets = rng.choice(unique_targets, size=len(unique_targets), replace=True)
+
+        parts = []
+        for i, target in enumerate(sampled_targets):
+            temp = base[base["target_id"] == target].copy()
+            temp["target_id"] = f"boot_target_{i}"
+            parts.append(temp)
+
+        boot_df = pd.concat(parts, axis=0)
+
+        try:
+            out = fit_icc_for_column(boot_df, score_col, k=k)
+            icc21_vals.append(out["ICC(2,1)"])
+            icc2k_vals.append(out[f"ICC(2,{k})"])
+        except Exception:
+            continue
+
+    return {
+        "score": score_col,
+        "ICC(2,1)_mean": np.mean(icc21_vals) if icc21_vals else np.nan,
+        "ICC(2,1)_ci_lower": np.percentile(icc21_vals, 2.5) if icc21_vals else np.nan,
+        "ICC(2,1)_ci_upper": np.percentile(icc21_vals, 97.5) if icc21_vals else np.nan,
+        f"ICC(2,{k})_mean": np.mean(icc2k_vals) if icc2k_vals else np.nan,
+        f"ICC(2,{k})_ci_lower": np.percentile(icc2k_vals, 2.5) if icc2k_vals else np.nan,
+        f"ICC(2,{k})_ci_upper": np.percentile(icc2k_vals, 97.5) if icc2k_vals else np.nan,
+        "n_successful_bootstraps": len(icc21_vals),
+    }
+
+
+# =========================================================
+# Manual ICC(1,1) for unbalanced data
+# =========================================================
+def calculate_unbalanced_icc11(data: pd.DataFrame, target_col: str, score_col: str) -> float:
+    """
+    ICC(1,1) for unbalanced design.
+    """
+    temp = data[[target_col, score_col]].dropna()
+
+    n_total = len(temp)
+    n_targets = temp[target_col].nunique()
+
+    group_means = temp.groupby(target_col)[score_col].mean()
+    group_counts = temp.groupby(target_col)[score_col].count()
+    grand_mean = temp[score_col].mean()
+
+    ssb = sum(group_counts * (group_means - grand_mean) ** 2)
+    msb = ssb / (n_targets - 1)
+
+    def within_ss(group):
+        return sum((group - group.mean()) ** 2)
+
+    ssw = temp.groupby(target_col)[score_col].apply(within_ss).sum()
+    msw = ssw / (n_total - n_targets)
+
+    k0 = (1 / (n_targets - 1)) * (n_total - sum(group_counts ** 2) / n_total)
+
+    icc = (msb - msw) / (msb + (k0 - 1) * msw)
+    return icc
+
+
+# =========================================================
+# Convenience runner
+# =========================================================
+def run_basic_analysis(file_path: str):
+    """
+    Example analysis pipeline.
+    """
+    df = smart_load(file_path)
+    df = prepare_dataframe(df)
+
+    print("\n=== Overall summary by responder ===")
+    overall_summary = get_grouped_summary(df, "responder")
+    print(overall_summary.to_string(index=False))
+
+    if "domain" in df.columns:
+        print("\n=== Mean scores by domain and responder ===")
+        domain_means = get_domain_means(df)
+        print(domain_means.to_string(index=False))
+
+    if {"word_count", "response_id"}.issubset(df.columns):
+        print("\n=== Word count summary ===")
+        wc_summary = get_word_count_summary(df)
+        print(wc_summary.to_string())
+
+    if {"target_id", "rater_id"}.issubset(df.columns):
+        print("\n=== ICC table ===")
+        icc_table = get_icc_table(df, k=3, exact_k_only=True)
+        print(icc_table.to_string(index=False))
+
+
+# =========================================================
+# Example usage
+# =========================================================
+if __name__ == "__main__":
+    file_path = "ratings.xlsx"  # Replace with your actual file path
+    run_basic_analysis(file_path)
