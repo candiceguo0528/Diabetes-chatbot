@@ -1,0 +1,485 @@
+from __future__ import annotations
+
+import base64
+import json
+import mimetypes
+import os
+from pathlib import Path
+from typing import List, Optional, Union
+
+import pandas as pd
+from openai import OpenAI
+from langchain_openai import OpenAIEmbeddings
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_community.vectorstores import FAISS
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+
+###############################################################################
+# CGM Analysis from Excel
+###############################################################################
+
+def analyze_cgm_from_excel(file_path: Union[str, Path], tir_range: tuple = (70, 180)) -> dict:
+    df = pd.read_excel(file_path)
+
+    time_col = next(
+        (col for col in df.columns if "date" in col.lower() or "time" in col.lower() or "时间" in col.lower()),
+        None
+    )
+    if not time_col:
+        raise ValueError("No valid time column found.")
+
+    df[time_col] = pd.to_datetime(df[time_col], errors="coerce")
+    df = df.dropna(subset=[time_col])
+
+    glucose_col = next(
+        (col for col in df.columns if "cgm" in col.lower() and "mg" in col.lower()),
+        None
+    )
+    if not glucose_col:
+        raise ValueError("No CGM column found.")
+
+    df = df.dropna(subset=[glucose_col]).copy()
+    df = df.sort_values(time_col)
+
+    values = pd.to_numeric(df[glucose_col], errors="coerce").dropna()
+    if values.empty:
+        raise ValueError("No valid glucose values found.")
+
+    n = len(values)
+    start = df[time_col].min().floor("D")
+    end = df[time_col].max().floor("D")
+    days = (end - start).days + 1
+
+    intervals = df[time_col].diff().dropna().dt.total_seconds() / 60
+    median_interval = intervals.median() if not intervals.empty else 5
+    expected_per_day = int(1440 / median_interval) if median_interval and median_interval > 0 else 288
+    completeness = n / (days * expected_per_day) * 100 if days > 0 else 0
+
+    low, high = tir_range
+    tir = (values.between(low, high).mean()) * 100
+    tar = (values > high).mean() * 100
+    tar250 = (values > 250).mean() * 100
+    tbr = (values < low).mean() * 100
+    tbr54 = (values < 54).mean() * 100
+
+    mean_glucose = values.mean()
+    std_glucose = values.std()
+    cv = std_glucose / mean_glucose * 100 if mean_glucose else 0
+    gmi = 3.31 + 0.02392 * mean_glucose
+
+    return {
+        "monitoring_days": days,
+        "total_readings": int(n),
+        "wear_completeness": round(completeness, 1),
+        "mean_glucose": round(mean_glucose, 1),
+        "gmi": round(gmi, 2),
+        "sd": round(std_glucose, 1),
+        "cv": round(cv, 1),
+        "tir": round(tir, 1),
+        "above_180": round(tar, 1),
+        "above_250": round(tar250, 1),
+        "below_70": round(tbr, 1),
+        "below_54": round(tbr54, 1),
+    }
+
+
+def format_cgm_summary_table(stats: dict) -> str:
+    return f"""CGM Analysis Report
+-------------------
+Monitoring days              : {stats['monitoring_days']}
+Wear time completeness       : {stats['wear_completeness']}% (target ≥70%)
+Total readings               : {stats['total_readings']}
+
+Mean glucose                 : {stats['mean_glucose']} mg/dL
+GMI (estimated HbA1c)        : {stats['gmi']}%
+Standard deviation (SD)      : {stats['sd']} mg/dL
+Coefficient of variation (CV): {stats['cv']}% (target <36%)
+
+Time in Range 70–180         : {stats['tir']}% (target ≥70%)
+Time Below <70 mg/dL         : {stats['below_70']}% (target <4%)
+  └─ Severe <54 mg/dL        : {stats['below_54']}% (target <1%)
+Time Above >180 mg/dL        : {stats['above_180']}% (target <25%)
+  └─ Very high >250 mg/dL    : {stats['above_250']}% (target <5%)"""
+
+
+###############################################################################
+# Patient Info
+###############################################################################
+
+def load_patient_info(path: Union[str, Path]) -> str:
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"File not found: {path}")
+
+    if path.suffix.lower() == ".csv":
+        df = pd.read_csv(path)
+        data = df.to_dict(orient="records")[0]
+        return "\n".join([f"{k.replace('_', ' ').capitalize()}: {v}" for k, v in data.items()])
+
+    if path.suffix.lower() == ".json":
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            data = json.load(f)
+        return "\n".join([f"{k.replace('_', ' ').capitalize()}: {v}" for k, v in data.items()])
+
+    if path.suffix.lower() == ".docx":
+        from docx import Document
+        doc = Document(path)
+        lines = [para.text.strip() for para in doc.paragraphs if para.text.strip()]
+        return "\n".join(lines)
+
+    if path.suffix.lower() == ".txt":
+        return path.read_text(encoding="utf-8", errors="ignore")
+
+    raise ValueError("Unsupported patient profile format. Use .csv, .json, .docx, or .txt")
+
+
+###############################################################################
+# Image Helpers
+###############################################################################
+
+def encode_image_to_data_url(image_path: Union[str, Path]) -> str:
+    image_path = Path(image_path)
+    if not image_path.exists():
+        raise FileNotFoundError(f"Image not found: {image_path}")
+
+    mime_type, _ = mimetypes.guess_type(str(image_path))
+    if mime_type is None:
+        mime_type = "image/png"
+
+    with open(image_path, "rb") as f:
+        image_bytes = f.read()
+
+    b64 = base64.b64encode(image_bytes).decode("utf-8")
+    return f"data:{mime_type};base64,{b64}"
+
+
+def collect_image_paths(
+    image_inputs: Optional[Union[str, Path, List[Union[str, Path]]]]
+) -> List[Path]:
+    if image_inputs is None:
+        return []
+
+    if isinstance(image_inputs, (str, Path)):
+        image_inputs = [image_inputs]
+
+    valid_suffixes = {".png", ".jpg", ".jpeg", ".webp"}
+    image_paths: List[Path] = []
+
+    for item in image_inputs:
+        p = Path(item)
+        if p.is_dir():
+            for child in sorted(p.iterdir()):
+                if child.suffix.lower() in valid_suffixes:
+                    image_paths.append(child)
+        elif p.is_file() and p.suffix.lower() in valid_suffixes:
+            image_paths.append(p)
+        else:
+            print(f"Skipping invalid image path: {p}")
+
+    return image_paths
+
+
+###############################################################################
+# Vector Store for RAG
+###############################################################################
+
+def build_vector_store_from_pdf(pdf_path: Union[str, Path], api_key: str):
+    pdf_path = Path(pdf_path)
+    if not pdf_path.exists():
+        return None
+
+    loader = PyPDFLoader(str(pdf_path))
+    docs = loader.load()
+
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=800,
+        chunk_overlap=150
+    )
+    chunks = splitter.split_documents(docs)
+
+    embeddings = OpenAIEmbeddings(api_key=api_key)
+    vectorstore = FAISS.from_documents(chunks, embeddings)
+    return vectorstore
+
+
+def rag_retrieve(query: str, vectorstore, k: int = 3) -> str:
+    if vectorstore is None:
+        return ""
+
+    docs = vectorstore.similarity_search(query, k=k)
+    if not docs:
+        return ""
+
+    output = []
+    for i, doc in enumerate(docs, start=1):
+        page = doc.metadata.get("page", "unknown")
+        output.append(f"[Reference {i} | page {page}]\n{doc.page_content}")
+
+    return "\n\n".join(output)
+
+
+def needs_rag(text: str) -> bool:
+    keywords = [
+        "what", "how", "why", "tir", "a1c", "gmi", "guideline",
+        "explain", "recommendation", "meal", "diet", "exercise",
+        "insulin", "medication", "low", "high", "hypo", "hyper"
+    ]
+    text_lower = text.lower()
+    return any(k in text_lower for k in keywords)
+
+
+###############################################################################
+# Prompts
+###############################################################################
+
+SYSTEM_PROMPT = """You are GluMentor, a board-certified diabetes specialist.
+
+Your role is to help interpret Continuous Glucose Monitoring (CGM) data in a calm, empathetic, clinically responsible way. The patient may feel anxious, uncertain, or overwhelmed, so your tone should be reassuring, warm, and clear.
+
+General requirements:
+- Speak like a thoughtful doctor talking to a patient in a relaxed face-to-face consultation.
+- Use plain, accessible language and avoid unnecessary jargon.
+- Do not use bullet points in the final answer unless the user explicitly asks for them.
+- Base your interpretation only on the information provided.
+- Do not invent symptoms, diagnoses, medications, or lifestyle details that were not supplied.
+- Do not make definitive diagnoses from CGM alone.
+- Do not prescribe medication changes or insulin dose adjustments unless the system is explicitly designed and authorized for that purpose.
+- If patterns seem concerning, explain this calmly and recommend appropriate follow-up with the diabetes care team rather than creating alarm.
+- When images are provided, incorporate them into the interpretation only if they are relevant and visible. If an image is unclear, say so briefly rather than guessing.
+- Prioritize the 1–2 most clinically meaningful observations rather than commenting on every metric equally.
+- Keep answers natural, supportive, and not overly scripted.
+"""
+
+
+INITIAL_USER_PROMPT = """Please review the following patient context and give an initial integrated interpretation.
+
+PATIENT PROFILE
+────────────────
+{patient_info}
+
+CGM DATA SUMMARY
+────────────────
+{summary}
+
+REFERENCE INFORMATION
+────────────────
+{rag_context}
+
+Please provide a supportive and clinically grounded interpretation that:
+begins with a warm acknowledgement of the patient's efforts and a brief overall impression of the glucose pattern;
+explains the average glucose and estimated HbA1c (GMI) in simple terms;
+explains variability (SD and CV) in plain language;
+explains Time in Range and what {tir:.1f}% means in practical terms;
+highlights any important high or low glucose patterns that can be reasonably inferred from the data and/or images;
+gently identifies the most important priorities for improvement;
+offers 3 to 5 practical next steps tailored to the patient profile, CGM findings, and any visible image information.
+
+Finish by gently asking what the patient would like to focus on next in their diabetes journey.
+"""
+
+
+FOLLOWUP_USER_PROMPT = """Continue the diabetes consultation.
+
+PATIENT PROFILE
+────────────────
+{patient_info}
+
+CGM DATA SUMMARY
+────────────────
+{summary}
+
+REFERENCE INFORMATION
+────────────────
+{rag_context}
+
+USER QUESTION
+────────────────
+{user_input}
+
+Please answer the user's actual question directly.
+Do not restate the full CGM summary unless needed. You may briefly mention relevant CGM or image findings when they help answer the question.
+Keep the answer supportive, clinically relevant, practical, and conversational.
+"""
+
+
+###############################################################################
+# OpenAI Multimodal Helpers
+###############################################################################
+
+def build_multimodal_user_content(text_prompt: str, image_paths: Optional[List[Path]] = None) -> list:
+    content = [{"type": "input_text", "text": text_prompt}]
+    image_paths = image_paths or []
+
+    for img_path in image_paths:
+        data_url = encode_image_to_data_url(img_path)
+        content.append({
+            "type": "input_image",
+            "image_url": data_url
+        })
+
+    return content
+
+
+def call_glumentor(
+    client: OpenAI,
+    model_name: str,
+    system_prompt: str,
+    conversation_history: list,
+    user_text_prompt: str,
+    image_paths: Optional[List[Path]] = None,
+) -> str:
+    input_payload = [
+        {
+            "role": "system",
+            "content": [{"type": "input_text", "text": system_prompt}]
+        }
+    ]
+
+    for turn in conversation_history:
+        if turn["role"] == "user":
+            input_payload.append({
+                "role": "user",
+                "content": [{"type": "input_text", "text": turn["content"]}]
+            })
+        elif turn["role"] == "assistant":
+            input_payload.append({
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": turn["content"]}]
+            })
+
+    input_payload.append({
+        "role": "user",
+        "content": build_multimodal_user_content(user_text_prompt, image_paths=image_paths)
+    })
+
+    response = client.responses.create(
+        model=model_name,
+        input=input_payload
+    )
+
+    return response.output_text.strip()
+
+
+###############################################################################
+# Chatbot Interaction
+###############################################################################
+
+def run_glu_mentor_with_memory(
+    summary_text: str,
+    tir: float,
+    patient_info: str,
+    api_key: str,
+    vectorstore=None,
+    initial_image_paths: Optional[List[Path]] = None,
+    model_name: str = "gpt-5.1",
+):
+    client = OpenAI(api_key=api_key)
+    history: list = []
+
+    initial_rag_context = "No additional guideline context retrieved."
+    initial_prompt = INITIAL_USER_PROMPT.format(
+        summary=summary_text,
+        tir=tir,
+        patient_info=patient_info,
+        rag_context=initial_rag_context
+    )
+
+    first_answer = call_glumentor(
+        client=client,
+        model_name=model_name,
+        system_prompt=SYSTEM_PROMPT,
+        conversation_history=history,
+        user_text_prompt=initial_prompt,
+        image_paths=initial_image_paths,
+    )
+
+    print("\nGluMentor:\n")
+    print(first_answer)
+
+    history.append({"role": "user", "content": initial_prompt})
+    history.append({"role": "assistant", "content": first_answer})
+
+    while True:
+        user_input = input("\nYou: ").strip()
+        if user_input.lower() in {"exit", "quit"}:
+            print("GluMentor: Goodbye!")
+            break
+
+        image_input = input("Optional image path(s), separated by commas, or press Enter to skip: ").strip()
+        turn_images = []
+        if image_input:
+            raw_paths = [x.strip() for x in image_input.split(",") if x.strip()]
+            turn_images = collect_image_paths(raw_paths)
+
+        rag_context = rag_retrieve(user_input, vectorstore) if needs_rag(user_input) else "No guideline reference retrieved."
+
+        followup_prompt = FOLLOWUP_USER_PROMPT.format(
+            summary=summary_text,
+            patient_info=patient_info,
+            user_input=user_input,
+            rag_context=rag_context
+        )
+
+        answer = call_glumentor(
+            client=client,
+            model_name=model_name,
+            system_prompt=SYSTEM_PROMPT,
+            conversation_history=history,
+            user_text_prompt=followup_prompt,
+            image_paths=turn_images,
+        )
+
+        print("\nGluMentor:\n")
+        print(answer)
+
+        history.append({"role": "user", "content": followup_prompt})
+        history.append({"role": "assistant", "content": answer})
+
+
+###############################################################################
+# Main
+###############################################################################
+
+if __name__ == "__main__":
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        raise EnvironmentError("Please set OPENAI_API_KEY as an environment variable.")
+
+    # === Required files ===
+    CGM_FILE = r"C:\Users\Zhijun\Desktop\diabetes\seleted chinese dataset\2021_0_20211013.xlsx"
+    PATIENT_PROFILE = r"C:\Users\Zhijun\Desktop\diabetes\seleted chinese dataset\patient profile\1013-t2.docx"
+
+    # === Optional PDF guideline for RAG ===
+    PDF_GUIDELINE = r"C:\Users\Bolin\Desktop\diabetes\diabetes data\CGM Data Interpretation.pdf"
+
+    # === Optional initial images ===
+    # You can pass a single file, multiple files, or an entire folder.
+    INITIAL_IMAGES = [
+        r"C:\Users\Zhijun\Desktop\diabetes\images\agp_report.png",
+        r"C:\Users\Zhijun\Desktop\diabetes\images\meal_photo.jpg",
+    ]
+    # Or:
+    # INITIAL_IMAGES = r"C:\Users\Zhijun\Desktop\diabetes\images"
+
+    summary_stats = analyze_cgm_from_excel(CGM_FILE)
+    summary_text = format_cgm_summary_table(summary_stats)
+    tir = summary_stats["tir"]
+
+    patient_info = load_patient_info(PATIENT_PROFILE)
+    vectorstore = build_vector_store_from_pdf(PDF_GUIDELINE, api_key)
+
+    initial_image_paths = collect_image_paths(INITIAL_IMAGES)
+
+    print("\n📋 CGM Summary:\n")
+    print(summary_text)
+
+    run_glu_mentor_with_memory(
+        summary_text=summary_text,
+        tir=tir,
+        patient_info=patient_info,
+        api_key=api_key,
+        vectorstore=vectorstore,
+        initial_image_paths=initial_image_paths,
+        model_name="gpt-5.1",
+    )
